@@ -1,8 +1,5 @@
 module github.com/millken/service
 
-go 1.10
+go 1.13
 
-require (
-	github.com/millken/service v1.0.0
-	golang.org/x/sys v0.0.0-20190204203706-41f3e6584952
-)
+require golang.org/x/sys v0.0.0-20200223170610-d5e6a3e2c0ae
