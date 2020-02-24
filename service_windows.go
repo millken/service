@@ -12,7 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
@@ -20,6 +22,19 @@ import (
 )
 
 const version = "windows-service"
+
+const (
+	recoverActionDelay      = time.Second * 20
+	failureCountResetPeriod = time.Hour * 24
+
+	// not defined in golang.org/x/sys/windows package
+	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms681988(v=vs.85).aspx
+	serviceConfigFailureActionsFlag = 4
+
+	// ERROR_FAILED_SERVICE_CONTROLLER_CONNECT
+	// https://docs.microsoft.com/en-us/windows/desktop/debug/system-error-codes--1000-1299-
+	serviceControllerConnectionFailure = 1063
+)
 
 type windowsService struct {
 	i Interface
@@ -225,6 +240,12 @@ func (ws *windowsService) Install() error {
 			s.Delete()
 			return fmt.Errorf("SetupEventLogSource() failed: %s", err)
 		}
+	}
+	// Set up Recovery Properties of the service so it restarts on failure.
+	// This feature is not fully supported on Windows Server 2003 and Windows XP.
+	err = configRecoveryOption(s.Handle)
+	if err != nil {
+		return fmt.Errorf("Cannot set service recovery actions: %s", err)
 	}
 	return nil
 }
@@ -433,4 +454,59 @@ func (ws *windowsService) SystemLogger(errs chan<- error) (Logger, error) {
 		return nil, err
 	}
 	return WindowsLogger{el, errs}, nil
+}
+
+// defined in https://msdn.microsoft.com/en-us/library/windows/desktop/ms685126(v=vs.85).aspx
+type scAction int
+
+// https://msdn.microsoft.com/en-us/library/windows/desktop/ms685126(v=vs.85).aspx
+const (
+	scActionNone scAction = iota
+	scActionRestart
+	scActionReboot
+	scActionRunCommand
+)
+
+// defined in https://msdn.microsoft.com/en-us/library/windows/desktop/ms685939(v=vs.85).aspx
+type serviceFailureActions struct {
+	// time to wait to reset the failure count to zero if there are no failures in seconds
+	resetPeriod uint32
+	rebootMsg   *uint16
+	command     *uint16
+	// If failure count is greater than actionCount, the service controller repeats
+	// the last action in actions
+	actionCount uint32
+	actions     uintptr
+}
+
+// https://msdn.microsoft.com/en-us/library/windows/desktop/ms685937(v=vs.85).aspx
+// Not supported in Windows Server 2003 and Windows XP
+type serviceFailureActionsFlag struct {
+	// enableActionsForStopsWithErr is of type BOOL, which is declared as
+	// typedef int BOOL in C
+	enableActionsForStopsWithErr int
+}
+
+type recoveryAction struct {
+	recoveryType uint32
+	// The time to wait before performing the specified action, in milliseconds
+	delay uint32
+}
+
+// until https://github.com/golang/go/issues/23239 is release, we will need to
+// configure through ChangeServiceConfig2
+func configRecoveryOption(handle windows.Handle) error {
+	actions := []recoveryAction{
+		{recoveryType: uint32(scActionRestart), delay: uint32(recoverActionDelay / time.Millisecond)},
+	}
+	serviceRecoveryActions := serviceFailureActions{
+		resetPeriod: uint32(failureCountResetPeriod / time.Second),
+		actionCount: uint32(len(actions)),
+		actions:     uintptr(unsafe.Pointer(&actions[0])),
+	}
+	if err := windows.ChangeServiceConfig2(handle, windows.SERVICE_CONFIG_FAILURE_ACTIONS, (*byte)(unsafe.Pointer(&serviceRecoveryActions))); err != nil {
+		return err
+	}
+	serviceFailureActionsFlag := serviceFailureActionsFlag{enableActionsForStopsWithErr: 1}
+	return windows.ChangeServiceConfig2(handle, serviceConfigFailureActionsFlag, (*byte)(unsafe.Pointer(&serviceFailureActionsFlag)))
 }
